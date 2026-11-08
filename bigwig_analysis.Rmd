@@ -1,0 +1,1352 @@
+---
+title: "bigwig_analysis"
+author: "Daniel Arango"
+date: "28/10/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(rtracklayer)
+library(GenomicRanges)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+
+```
+
+## Sample Concordance 
+
+```{r reproducibility, message = FALSE, warning = FALSE, fig.width = 4, fig.height = 4, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+bw_files <- c("WT1_5_end_R1.bw", "WT2_5_end_R1.bw", "Helicase1_5_end_R1.bw", "Helicase2_5_end_R1.bw", "WT1_3_end_R2.bw", "WT2_3_end_R2.bw", "Helicase1_3_end_R2.bw", "Helicase2_3_end_R2.bw")
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region    <- GRanges(chr, IRanges(start, end))
+positions <- start:end
+
+# ---- Per-base extraction (one value per nucleotide) ----
+results <- data.frame(Position = positions)
+for (file in bw_files) {
+  vals <- import(file, which = region, as = "NumericList")[[1]]
+  vals[is.na(vals)] <- 0                       # gaps in the bigWig -> 0
+  results[[basename(file)]] <- as.numeric(vals)
+}
+
+# ---- Sum replicates ----
+pairs <- tribble(
+  ~new_name,  ~rep1,           ~rep2,
+  "wildtype_5", "WT1_5_end_R1.bw",  "WT2_5_end_R1.bw",
+  "helicase_5", "Helicase1_5_end_R1.bw",  "Helicase2_5_end_R1.bw",
+  "wildtype_3", "WT1_3_end_R2.bw",  "WT2_3_end_R2.bw",
+  "helicase_3", "Helicase1_3_end_R2.bw",  "Helicase2_3_end_R2.bw"
+)
+
+bin_size <- 50
+
+# ---- Individual replicates, binned, log-transformed ----
+binned <- results %>%
+  mutate(bin = (Position - 1) %/% bin_size) %>%
+  group_by(bin) %>%
+  summarise(across(-Position, mean), .groups = "drop") %>%
+  select(-bin)
+
+mat <- log2(as.matrix(binned) + 1)
+colnames(mat) <- sub("\\.bw$", "", colnames(mat))
+mat <- mat[rowSums(mat) > 0, ]                 # drop bins with no signal in any sample
+
+# Sample -> condition lookup
+sample_info <- pairs %>%
+  pivot_longer(c(rep1, rep2), names_to = "replicate", values_to = "file") %>%
+  mutate(sample    = sub("\\.bw$", "", file),
+         condition = factor(new_name, levels = pairs$new_name))
+
+# ---- 1. Pearson correlation heatmap (all samples) ----
+cor_mat <- cor(mat, method = "pearson")
+cor_df  <- as.data.frame(as.table(cor_mat))
+
+ggplot(cor_df, aes(Var1, Var2, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.3f", Freq)), size = 2.3) +
+  scale_fill_gradient(low = "white", high = "firebrick",
+                      limits = c(min(cor_df$Freq), 1)) +
+  coord_fixed() +
+  labs(x = NULL, y = NULL, fill = "Pearson r") +
+  theme_minimal(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ---- 2. Replicate-vs-replicate scatter plots ----
+scatter_df <- bind_rows(lapply(seq_len(nrow(pairs)), function(i) {
+  data.frame(condition = pairs$new_name[i],
+             rep1 = mat[, sub("\\.bw$", "", pairs$rep1[i])],
+             rep2 = mat[, sub("\\.bw$", "", pairs$rep2[i])])
+})) %>%
+  mutate(condition = factor(condition, levels = pairs$new_name))
+
+r_lab <- scatter_df %>%
+  group_by(condition) %>%
+  summarise(r = cor(rep1, rep2), .groups = "drop")
+
+ggplot(scatter_df, aes(rep1, rep2)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_text(data = r_lab, aes(x = -Inf, y = Inf, label = sprintf("r = %.3f", r)),
+            hjust = -0.1, vjust = 1.5, size = 2.8) +
+  facet_wrap(~ condition) +
+  coord_fixed() +
+  labs(x = "Replicate 1, log2(signal + 1)", y = "Replicate 2, log2(signal + 1)") +
+  theme_classic(base_size = 8)
+
+# ---- 3. PCA ----
+pca     <- prcomp(t(mat), center = TRUE, scale. = FALSE)
+var_exp <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+pca_df <- data.frame(sample = rownames(pca$x), PC1 = pca$x[, 1], PC2 = pca$x[, 2]) %>%
+  left_join(sample_info, by = "sample")
+
+ggplot(pca_df, aes(PC1, PC2, colour = condition)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = sample), vjust = -1.2, size = 2.3, show.legend = FALSE) +
+  labs(x = sprintf("PC1 (%.1f%%)", var_exp[1]),
+       y = sprintf("PC2 (%.1f%%)", var_exp[2]),
+       colour = NULL) +
+  theme_classic(base_size = 8)
+
+```
+
+#Inspect across 47S - linear scale, no normalization
+
+```{r whole_47S, message = FALSE, warning = FALSE, fig.width = 20, fig.height = 4, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+bw_files <- c("WT1_5_end_R1.bw", "WT2_5_end_R1.bw", "WT1_3_end_R2.bw", "WT2_3_end_R2.bw")
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region    <- GRanges(chr, IRanges(start, end))
+positions <- start:end
+
+# ---- Per-base extraction (one value per nucleotide) ----
+results <- data.frame(Position = positions)
+for (file in bw_files) {
+  vals <- import(file, which = region, as = "NumericList")[[1]]
+  vals[is.na(vals)] <- 0                       # gaps in the bigWig -> 0
+  results[[basename(file)]] <- as.numeric(vals)
+}
+
+# ---- Sum replicates ----
+pairs <- tribble(
+  ~new_name,  ~rep1,           ~rep2,
+  "end5",   "WT1_5_end_R1.bw",  "WT2_5_end_R1.bw",
+  "end3",   "WT1_3_end_R2.bw",  "WT2_3_end_R2.bw"
+)
+
+Sum <- data.frame(Position = positions - start + 1)
+for (i in seq_len(nrow(pairs))) {
+  r1 <- pairs$rep1[i]; r2 <- pairs$rep2[i]
+  if (all(c(r1, r2) %in% names(results))) {
+    Sum[[pairs$new_name[i]]] <- results[[r1]] + results[[r2]]
+  } else {
+    warning("Skipping ", pairs$new_name[i], " (missing file column)")
+  }
+}
+
+x_range <- c(0.5, 13357.5)   # shared by both panels so positions line up
+
+# ---- Coverage tracks ----
+whole_long <- Sum %>%
+  pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+  mutate(sample = factor(sample, levels = pairs$new_name))
+
+p_main <- ggplot(whole_long, aes(Position, signal, fill = sample)) +
+  geom_col(width = 1, show.legend = FALSE) +
+  scale_fill_manual(values = c(end5 = "#2166AC", end3 = "#B2182B")) +
+  facet_wrap(~ sample, ncol = 1, strip.position = "left") +
+  scale_y_continuous(breaks = c(0, 0.5e8, 1e8, 1.5e8, 2e8),
+                     labels = expression(0, 0.5 %*% 10^8, 1 %*% 10^8, 1.5 %*% 10^8, 2 %*% 10^8)) + #5.8S is cut with this scale  but it allows visualization of 18S and 28S in the same scale
+  coord_cartesian(xlim = x_range, ylim = c(0, 2e8), expand = FALSE) +
+  labs(x = NULL, y = "Signal") +
+  theme_classic(base_size = 8) +
+  theme(strip.background  = element_blank(),
+        strip.placement   = "outside",
+        strip.text.y.left = element_text(angle = 0),
+        axis.text.x       = element_blank(),
+        axis.ticks.x      = element_blank())
+
+# ---- 47S map ----
+features <- tribble(
+  ~name,   ~fstart, ~fend,  ~type,
+  "5ETS",       1,  3654, "spacer",
+  "18S",     3655,  5523, "mature",
+  "ITS1",    5524,  6600, "spacer",
+  "5.8S",    6601,  6758, "mature",
+  "ITS2",    6758,  7924, "spacer",
+  "28S",     7925, 12994, "mature",
+  "3ETS",   12995, 13357, "spacer"
+) %>%
+  mutate(half = ifelse(type == "mature", 0.4, 0.15),
+         mid  = (fstart + fend) / 2)
+
+sites <- tribble(
+  ~name,      ~sstart, ~send,
+  "A'",          424,   425,
+  "A0",         1642,  1643,
+  "A1",         3654,  3655,
+  "E",          5602,  5603,
+  "A2",         6459,  6460,
+  "4a",         6915,  6965,
+  "4",          7581,  7582
+) %>%
+  mutate(x = (sstart + send) / 2) %>%
+  arrange(x) %>%
+  mutate(tier = (row_number() - 1) %% 3,
+         yh   = 0.9 + tier * 0.55)
+
+p_anno <- ggplot() +
+  geom_rect(data = features,
+            aes(xmin = fstart - 0.5, xmax = fend + 0.5, ymin = -half, ymax = half, fill = type),
+            show.legend = FALSE) +
+  scale_fill_manual(values = c(mature = "grey20", spacer = "grey75")) +
+  geom_text(data = features, aes(x = mid, y = -0.75, label = name), size = 2.2) +
+  geom_segment(data = sites, aes(x = x, xend = x, y = 0.45, yend = yh),
+               linewidth = 0.25, colour = "grey40") +
+  geom_text(data = sites, aes(x = x, y = yh + 0.08, label = name), vjust = 0, size = 2) +
+  scale_x_continuous(breaks = seq(0, 13000, 1000)) +
+  coord_cartesian(xlim = x_range, ylim = c(-1.05, 2.3), expand = FALSE, clip = "off") +
+  labs(x = "Position on 47S (nt)", y = NULL) +
+  theme_classic(base_size = 8) +
+  theme(axis.line.y  = element_blank(),
+        axis.text.y  = element_blank(),
+        axis.ticks.y = element_blank())
+
+# ---- Combine ----
+p_main / p_anno + plot_layout(heights = c(2, 1))
+
+```
+
+## Compare R1 and R2 at each end
+
+``` {r R1_vs_R2, message = FALSE, warning = FALSE, fig.width = 3, fig.height = 6, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+# ---- Files: WT replicates for each library and read ----
+r1_files_5 <- c("WT1_5_end_R1.bw", "WT2_5_end_R1.bw")
+r2_files_5 <- c("WT1_5_end_R2.bw", "WT2_5_end_R2.bw")
+r1_files_3 <- c("WT1_3_end_R1.bw", "WT2_3_end_R1.bw")
+r2_files_3 <- c("WT1_3_end_R2.bw", "WT2_3_end_R2.bw")
+
+all_files <- c(r1_files_5, r2_files_5, r1_files_3, r2_files_3)
+missing <- all_files[!file.exists(all_files)]
+if (length(missing) > 0) stop("Files not found: ", paste(missing, collapse = ", "))
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region <- GRanges(chr, IRanges(start, end))
+flank  <- 200
+
+# Per-base signal summed over replicates
+sum_bw <- function(files) {
+  Reduce(`+`, lapply(files, function(f) {
+    v <- as.numeric(import(f, which = region, as = "NumericList")[[1]])
+    v[is.na(v)] <- 0
+    v
+  }))
+}
+
+# One figure per site: R1 on top, R2 at the bottom, shared y-axis
+plot_site <- function(r1_files, r2_files, site, title) {
+  idx <- max(site - flank, start):min(site + flank, end)
+
+  d <- bind_rows(
+    data.frame(Position = idx, signal = sum_bw(r1_files)[idx], read = "R1"),
+    data.frame(Position = idx, signal = sum_bw(r2_files)[idx], read = "R2")
+  ) %>%
+    mutate(read = factor(read, levels = c("R1", "R2")))
+
+  ggplot(d, aes(Position, signal, fill = read)) +
+    geom_col(width = 1, show.legend = FALSE) +
+    geom_vline(xintercept = site, linetype = "dashed", linewidth = 0.3) +
+    scale_fill_manual(values = c(R1 = "#2166AC", R2 = "#B2182B")) +
+    facet_wrap(~ read, ncol = 1, strip.position = "left") +   # same y-scale for R1 and R2
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)),
+                       labels = scales::label_scientific()) +
+    labs(title = title, x = "Position on 47S (nt)", y = "Signal (RPKM)") +
+    theme_classic(base_size = 8) +
+    theme(plot.title        = element_text(face = "bold", hjust = 0.5),
+          strip.background  = element_blank(),
+          strip.placement   = "outside",
+          strip.text.y.left = element_text(angle = 0, face = "bold"),
+          panel.spacing     = unit(6, "pt"))
+}
+
+# ---- Figure 1: 18S 5′ end, 5′-end libraries ----
+print(plot_site(r1_files_5, r2_files_5, site = 3655,
+                title = "18S 5′ end (3655), 5′-end library"))
+
+# ---- Figure 2: 18S 3′ end, 3′-end libraries ----
+print(plot_site(r1_files_3, r2_files_3, site = 5523,
+                title = "18S 3′ end (5523), 3′-end library"))
+
+```
+
+## Inspect each cleavage site individually for the 5'-end
+
+```{r cleavage_5_end, message = FALSE, warning = FALSE, fig.width = 14, fig.height = 4, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+bw_files <- c("WT1_5_end_R1.bw", "WT2_5_end_R1.bw", "Helicase1_5_end_R1.bw", "Helicase2_5_end_R1.bw")
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region    <- GRanges(chr, IRanges(start, end))
+positions <- start:end
+
+# ---- Per-base extraction (one value per nucleotide) ----
+results <- data.frame(Position = positions)
+for (file in bw_files) {
+  vals <- import(file, which = region, as = "NumericList")[[1]]
+  vals[is.na(vals)] <- 0                       # gaps in the bigWig -> 0
+  results[[basename(file)]] <- as.numeric(vals)
+}
+
+# ---- Sum replicates ----
+pairs <- tribble(
+  ~new_name,  ~rep1,           ~rep2,
+  "wildtype_5", "WT1_5_end_R1.bw",  "WT2_5_end_R1.bw",
+  "helicase_5", "Helicase1_5_end_R1.bw",  "Helicase2_5_end_R1.bw"
+)
+
+Sum <- data.frame(Position = positions - start + 1)
+for (i in seq_len(nrow(pairs))) {
+  r1 <- pairs$rep1[i]; r2 <- pairs$rep2[i]
+  if (all(c(r1, r2) %in% names(results))) {
+    Sum[[pairs$new_name[i]]] <- results[[r1]] + results[[r2]]
+  } else {
+    warning("Skipping ", pairs$new_name[i], " (missing file column)")
+  }
+}
+
+# ---- Region start points; window = start ± flank ----
+flank <- 75
+
+regions <- tribble(
+  ~region,  ~rstart,
+  "5'end",       1,
+  "A'",        424,
+  "A0",       1620,
+  "18S",      3654,
+  "E",        5601,
+  "A2",       6460,
+  "5.8",      6595,
+  "4a",       6915,
+  "4",        7580,
+  "28S",      7925
+) %>%
+  mutate(wstart = pmax(rstart - flank, start),   # don't go below position 1
+         wend   = pmin(rstart + flank, end),
+         region = factor(region, levels = region))
+
+# ---- Data to use: Sum = summed replicates; results = individual replicates ----
+dat <- Sum
+
+dat_long <- dat %>%
+  pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+  mutate(sample = factor(sample, levels = setdiff(names(dat), "Position")))
+
+# ---- Whole gene (all 13,352 nt) ----
+whole_gene_rpkm <- dat_long %>%
+  group_by(sample) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop")
+
+# ---- Extract each window (overlapping windows are fine) ----
+win_long <- bind_rows(lapply(seq_len(nrow(regions)), function(i) {
+  dat_long %>%
+    filter(Position >= regions$wstart[i], Position <= regions$wend[i]) %>%
+    mutate(region = regions$region[i])
+}))
+
+# ---- Mean signal per window ----
+region_rpkm <- win_long %>%
+  group_by(sample, region) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop") %>%
+  pivot_wider(names_from = sample, values_from = mean_signal)
+
+# ---- Per-region y-max: full window max across samples, minimum 50,000 ----
+ylims <- win_long %>%
+  group_by(region) %>%
+  summarise(ymax = max(50000, max(signal)), .groups = "drop")
+
+###-------------
+#Plots
+###-------------
+
+cap_y <- TRUE   # FALSE = let each plot show its full range
+
+plot_region <- function(reg, first = FALSE) {
+  d  <- filter(win_long, region == reg)
+  r  <- filter(regions, region == reg)
+  ym <- ylims$ymax[ylims$region == reg]
+
+  ggplot(d, aes(Position, signal)) +
+       geom_col(aes(fill = sample), width = 1, show.legend = FALSE) +
+    scale_fill_manual(values = c(wildtype = "#2166AC", helicase = "#B2182B")) +
+    geom_vline(xintercept = r$rstart, colour = "red",
+               linetype = "dashed", linewidth = 0.3) +
+    facet_wrap(~ sample, ncol = 1, strip.position = "left") +
+    coord_cartesian(xlim = c(r$wstart - 0.5, r$wend + 0.5),
+                    ylim = if (cap_y) c(0, ym) else NULL,
+                    expand = FALSE) +
+    scale_y_continuous(labels = scales::label_comma()) +
+    labs(title = paste0(reg, "\n(", r$rstart, ")"),
+         x = NULL, y = if (first) "Signal" else NULL) +
+    theme_classic(base_size = 7) +
+    theme(plot.title        = element_text(face = "bold", hjust = 0.5),
+          strip.background  = element_blank(),
+          strip.placement   = "outside",
+          strip.text.y.left = if (first) element_text(angle = 0) else element_blank(),
+          axis.text.x       = element_text(angle = 90, vjust = 0.5))
+}
+
+lv <- levels(regions$region)
+plots <- lapply(seq_along(lv), function(i) plot_region(lv[i], first = (i == 1)))
+
+wrap_plots(plots, nrow = 1,
+           widths = regions$wend - regions$wstart + 1) +   # 5'end window is shorter (starts at 1)
+  plot_annotation(caption = "Position on 47S (nt)",
+                  theme = theme(plot.caption = element_text(hjust = 0.5, size = 8)))
+
+```
+
+## Inspect each cleavage site individually for the 3'-end
+
+```{r cleavage_3_end, message = FALSE, warning = FALSE, fig.width = 14, fig.height = 4, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+bw_files <- c("WT1_3_end_R2.bw", "WT2_3_end_R2.bw", "Helicase1_3_end_R2.bw", "Helicase2_3_end_R2.bw")
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region    <- GRanges(chr, IRanges(start, end))
+positions <- start:end
+
+# ---- Per-base extraction (one value per nucleotide) ----
+results <- data.frame(Position = positions)
+for (file in bw_files) {
+  vals <- import(file, which = region, as = "NumericList")[[1]]
+  vals[is.na(vals)] <- 0                       # gaps in the bigWig -> 0
+  results[[basename(file)]] <- as.numeric(vals)
+}
+
+# ---- Sum replicates ----
+pairs <- tribble(
+  ~new_name,  ~rep1,           ~rep2,
+  "wildtype_3", "WT1_3_end_R2.bw",  "WT2_3_end_R2.bw",
+  "helicase_3", "Helicase1_3_end_R2.bw",  "Helicase2_3_end_R2.bw"
+)
+
+Sum <- data.frame(Position = positions - start + 1)
+for (i in seq_len(nrow(pairs))) {
+  r1 <- pairs$rep1[i]; r2 <- pairs$rep2[i]
+  if (all(c(r1, r2) %in% names(results))) {
+    Sum[[pairs$new_name[i]]] <- results[[r1]] + results[[r2]]
+  } else {
+    warning("Skipping ", pairs$new_name[i], " (missing file column)")
+  }
+}
+
+# ---- Region start points; window = start ± flank ----
+flank <- 50
+
+regions <- tribble(
+  ~region,  ~rstart,
+  "A'",        424,
+  "A0",       1620,
+  "18S",      5523,
+  "E",        5601,
+  "A2",       6460,
+  "5.8",      6758,
+  "4a",       6975,
+  "4",        7580,
+  "28S",      12994,
+  "3ETS",     13357
+) %>%
+  mutate(wstart = pmax(rstart - flank, start),   # don't go below position 1
+         wend   = pmin(rstart + flank, end),
+         region = factor(region, levels = region))
+
+# ---- Data to use: Sum = summed replicates; results = individual replicates ----
+dat <- Sum
+
+dat_long <- dat %>%
+  pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+  mutate(sample = factor(sample, levels = setdiff(names(dat), "Position")))
+
+# ---- Whole gene (all 13,352 nt) ----
+whole_gene_rpkm <- dat_long %>%
+  group_by(sample) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop")
+
+# ---- Extract each window (overlapping windows are fine) ----
+win_long <- bind_rows(lapply(seq_len(nrow(regions)), function(i) {
+  dat_long %>%
+    filter(Position >= regions$wstart[i], Position <= regions$wend[i]) %>%
+    mutate(region = regions$region[i])
+}))
+
+# ---- Mean signal per window ----
+region_rpkm <- win_long %>%
+  group_by(sample, region) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop") %>%
+  pivot_wider(names_from = sample, values_from = mean_signal)
+
+# ---- Per-region y-max: full window max across samples, minimum 50,000 ----
+ylims <- win_long %>%
+  group_by(region) %>%
+  summarise(ymax = max(50000, max(signal)), .groups = "drop")
+
+###-------------
+#Plots
+###-------------
+
+cap_y <- TRUE   # FALSE = let each plot show its full range
+
+plot_region <- function(reg, first = FALSE) {
+  d  <- filter(win_long, region == reg)
+  r  <- filter(regions, region == reg)
+  ym <- ylims$ymax[ylims$region == reg]
+
+  ggplot(d, aes(Position, signal)) +
+       geom_col(aes(fill = sample), width = 1, show.legend = FALSE) +
+    scale_fill_manual(values = c(wildtype = "#2166AC", helicase = "#B2182B")) +
+    geom_vline(xintercept = r$rstart, colour = "red",
+               linetype = "dashed", linewidth = 0.3) +
+    facet_wrap(~ sample, ncol = 1, strip.position = "left") +
+    coord_cartesian(xlim = c(r$wstart - 0.5, r$wend + 0.5),
+                    ylim = if (cap_y) c(0, ym) else NULL,
+                    expand = FALSE) +
+    scale_y_continuous(labels = scales::label_comma()) +
+    labs(title = paste0(reg, "\n(", r$rstart, ")"),
+         x = NULL, y = if (first) "Signal" else NULL) +
+    theme_classic(base_size = 7) +
+    theme(plot.title        = element_text(face = "bold", hjust = 0.5),
+          strip.background  = element_blank(),
+          strip.placement   = "outside",
+          strip.text.y.left = if (first) element_text(angle = 0) else element_blank(),
+          axis.text.x       = element_text(angle = 90, vjust = 0.5))
+}
+
+lv <- levels(regions$region)
+plots <- lapply(seq_along(lv), function(i) plot_region(lv[i], first = (i == 1)))
+
+wrap_plots(plots, nrow = 1,
+           widths = regions$wend - regions$wstart + 1) +   # 5'end window is shorter (starts at 1)
+  plot_annotation(caption = "Position on 47S (nt)",
+                  theme = theme(plot.caption = element_text(hjust = 0.5, size = 8)))
+
+```
+
+## Inspect 10 nt upstream of mature 18S, 5.8S, and 28S
+## Inspect 10 nt downstream of mature 18S, 5.8S, and 28S
+
+```{r mature_flanks, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region    <- GRanges(chr, IRanges(start, end))
+positions <- start:end
+
+gap     <- 2    # nt between the mature boundary and the window
+win     <- 10   # window length (nt)
+y_floor <- 0    # minimum y-max per site (e.g. 10000); 0 = own maximum
+
+# ---- Load and sum replicates ----
+sum_pairs <- function(pairs) {
+  files   <- unique(c(pairs$rep1, pairs$rep2))
+  missing <- files[!file.exists(files)]
+  if (length(missing) > 0) stop("Files not found: ", paste(missing, collapse = ", "))
+
+  sig <- lapply(setNames(files, files), function(f) {
+    v <- as.numeric(import(f, which = region, as = "NumericList")[[1]])
+    v[is.na(v)] <- 0
+    v
+  })
+  out <- data.frame(Position = positions)
+  for (i in seq_len(nrow(pairs))) {
+    out[[pairs$new_name[i]]] <- sig[[pairs$rep1[i]]] + sig[[pairs$rep2[i]]]
+  }
+  out
+}
+
+# ---- One figure: sites side by side, conditions stacked ----
+plot_flanks <- function(Sum, sites, colours, caption) {
+
+  dat_long <- Sum %>%
+    pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+    mutate(sample = factor(sample, levels = names(colours)))
+
+  win_long <- bind_rows(lapply(seq_len(nrow(sites)), function(i) {
+    dat_long %>%
+      filter(Position >= sites$wstart[i], Position <= sites$wend[i]) %>%
+      mutate(region = sites$region[i])
+  }))
+
+  ylims <- win_long %>%
+    group_by(region) %>%
+    summarise(ymax = max(y_floor, max(signal)), .groups = "drop")
+
+  plot_one <- function(reg, first) {
+    d  <- filter(win_long, region == reg)
+    s  <- filter(sites, region == reg)
+    ym <- ylims$ymax[ylims$region == reg]
+
+    ggplot(d, aes(Position, signal, fill = sample)) +
+      geom_col(width = 1, show.legend = FALSE) +
+      scale_fill_manual(values = colours) +
+      facet_wrap(~ sample, ncol = 1, strip.position = "left") +
+      coord_cartesian(xlim = c(s$wstart - 0.5, s$wend + 0.5),
+                      ylim = c(0, ym), expand = FALSE) +
+      scale_y_continuous(labels = scales::label_comma()) +
+      labs(title = paste0(reg, "\n(", s$wstart, "–", s$wend, ")"),
+           x = NULL, y = if (first) "Signal (RPKM)" else NULL) +
+      theme_classic(base_size = 7) +
+      theme(plot.title        = element_text(face = "bold", hjust = 0.5),
+            strip.background  = element_blank(),
+            strip.placement   = "outside",
+            strip.text.y.left = if (first) element_text(angle = 0) else element_blank(),
+            axis.text.x       = element_text(angle = 90, vjust = 0.5))
+  }
+
+  lv <- levels(sites$region)
+  wrap_plots(lapply(seq_along(lv), function(i) plot_one(lv[i], first = (i == 1))), nrow = 1) +
+    plot_annotation(caption = caption,
+                    theme = theme(plot.caption = element_text(hjust = 0.5, size = 8)))
+}
+
+# ============================================================
+# Figure 1: upstream of mature 5′ ends (5′-end libraries, R1)
+# ============================================================
+pairs_5 <- tribble(
+  ~new_name,    ~rep1,                   ~rep2,
+  "wildtype_5", "WT1_5_end_R1.bw",       "WT2_5_end_R1.bw",
+  "helicase_5", "Helicase1_5_end_R1.bw", "Helicase2_5_end_R1.bw"
+)
+
+sites_5 <- tribble(
+  ~region,      ~site,
+  "18S 5′ end",  3655,
+  "5.8S 5′ end", 6601,
+  "28S 5′ end",  7925
+) %>%
+  mutate(wend   = site - gap,               # 2 nt upstream of the boundary
+         wstart = wend - win + 1,           # 10 nt to the left
+         region = factor(region, levels = region))
+
+print(plot_flanks(sum_pairs(pairs_5), sites_5,
+                  colours = c(wildtype_5 = "#2166AC", helicase_5 = "#B2182B"),
+                  caption = "Position on 47S (nt): 10 nt upstream of each mature 5′ end"))
+
+# ============================================================
+# Figure 2: downstream of mature 3′ ends (3′-end libraries, R2)
+# ============================================================
+pairs_3 <- tribble(
+  ~new_name,    ~rep1,                   ~rep2,
+  "wildtype_3", "WT1_3_end_R2.bw",       "WT2_3_end_R2.bw",
+  "helicase_3", "Helicase1_3_end_R2.bw", "Helicase2_3_end_R2.bw"
+)
+
+sites_3 <- tribble(
+  ~region,      ~site,
+  "18S 3′ end",  5523,
+  "5.8S 3′ end", 6758,
+  "28S 3′ end", 12994
+) %>%
+  mutate(wstart = site + gap,               # 2 nt downstream of the boundary
+         wend   = wstart + win - 1,         # 10 nt to the right
+         region = factor(region, levels = region))
+
+print(plot_flanks(sum_pairs(pairs_3), sites_3,
+                  colours = c(wildtype_3 = "#2166AC", helicase_3 = "#B2182B"),
+                  caption = "Position on 47S (nt): 10 nt downstream of each mature 3′ end"))
+
+```
+
+## Perform a normalized analysis in the region that show sharp 5'end
+
+```{r normalized_5_end, message = FALSE, warning = FALSE, fig.width = 20, fig.height = 4, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+bw_files <- c("WT1_5_end_R1.bw", "WT2_5_end_R1.bw", "Helicase1_5_end_R1.bw", "Helicase2_5_end_R1.bw")
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region    <- GRanges(chr, IRanges(start, end))
+positions <- start:end
+
+# ---- Per-base extraction (one value per nucleotide) ----
+results <- data.frame(Position = positions)
+for (file in bw_files) {
+  vals <- import(file, which = region, as = "NumericList")[[1]]
+  vals[is.na(vals)] <- 0                       # gaps in the bigWig -> 0
+  results[[basename(file)]] <- as.numeric(vals)
+}
+
+# ---- Sum replicates ----
+pairs <- tribble(
+  ~new_name,  ~rep1,           ~rep2,
+  "wildtype_5", "WT1_5_end_R1.bw",  "WT2_5_end_R1.bw",
+  "helicase_5", "Helicase1_5_end_R1.bw",  "Helicase2_5_end_R1.bw"
+)
+
+Sum <- data.frame(Position = positions - start + 1)
+for (i in seq_len(nrow(pairs))) {
+  r1 <- pairs$rep1[i]; r2 <- pairs$rep2[i]
+  if (all(c(r1, r2) %in% names(results))) {
+    Sum[[pairs$new_name[i]]] <- results[[r1]] + results[[r2]]
+  } else {
+    warning("Skipping ", pairs$new_name[i], " (missing file column)")
+  }
+}
+
+# ---- Region definitions: start positions + window length ----
+win <- 75   # nt to keep from the start of each region
+
+regions <- tribble(
+  ~region,  ~rstart,
+  "5'end",       1,
+  "A'",        424,
+  "18S",      3650,
+  "5.8",      6595,
+  "28S",      7925
+) %>%
+  mutate(rend   = rstart + win - 1,
+         region = factor(region, levels = region))
+
+# ---- Whole gene (all 13,352 nt), before any filtering ----
+whole_gene_rpkm <- Sum %>%
+  pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+  group_by(sample) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop")
+
+# ---- Keep only positions inside a window ----
+sum_long <- Sum %>%
+  pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+  mutate(sample = factor(sample, levels = pairs$new_name),
+         idx    = findInterval(Position, regions$rstart)) %>%
+  filter(idx > 0, Position <= regions$rend[pmax(idx, 1)]) %>%   # drop gaps between windows
+  mutate(region = regions$region[idx]) %>%
+  select(-idx)
+
+# ---- Mean signal per window ----
+region_rpkm <- sum_long %>%
+  group_by(sample, region) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop") %>%
+  pivot_wider(names_from = sample, values_from = mean_signal)
+
+# ---- Per-region y-limit: max of first 100 nt across samples, floor 10,000 ----
+ylims <- sum_long %>%
+  inner_join(regions, by = "region") %>%
+  filter(Position <= pmin(rstart + 99, rend)) %>%
+  group_by(region) %>%
+  summarise(ymax = max(10000, max(signal)), .groups = "drop")
+
+###-------------
+# Plots
+###-------------
+
+x_range <- c(0.5, 13357.5)   # shared by both panels so positions line up
+
+# Scale each window by its own y-max (1 = region max; values above are clipped)
+plot_df <- sum_long %>%
+  left_join(ylims, by = "region") %>%
+  mutate(signal_scaled = pmin(signal / ymax, 1))
+
+# Window labels for the top axis
+region_labels <- regions %>%
+  left_join(ylims, by = "region") %>%
+  mutate(mid = (rstart + rend) / 2,
+         lab = paste0(region, " (", scales::comma(ymax), ")"))
+
+# ---- Coverage tracks (windows only) ----
+p_main <- ggplot(plot_df, aes(Position, signal_scaled, group = region)) +
+  geom_rect(data = regions, inherit.aes = FALSE,                 # light band marking each window
+            aes(xmin = rstart - 0.5, xmax = rend + 0.5, ymin = 0, ymax = 1),
+            fill = "grey92") +
+  geom_area(aes(fill = sample), show.legend = FALSE) +
+  scale_fill_manual(values = c(wildtype = "#2166AC", helicase = "#B2182B")) +
+  facet_wrap(~ sample, ncol = 1, strip.position = "left") +
+  scale_x_continuous(expand = c(0, 0), limits = x_range,
+                     breaks = seq(0, 13000, 1000),
+                     sec.axis = dup_axis(breaks = region_labels$mid,
+                                         labels = region_labels$lab,
+                                         name = NULL)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 8) +
+  theme(strip.background    = element_blank(),
+        strip.placement     = "outside",
+        strip.text.y.left   = element_text(angle = 0),
+        axis.text.y         = element_blank(),
+        axis.ticks.y        = element_blank(),
+        axis.text.x.bottom  = element_blank(),     # positions shown under the map instead
+        axis.ticks.x.bottom = element_blank(),
+        axis.text.x.top     = element_text(angle = 90, hjust = 0, vjust = 0.5, size = 6))
+
+# ---- 47S map ----
+features <- tribble(
+  ~name,   ~fstart, ~fend,  ~type,
+  "5ETS",       1,  3654, "spacer",
+  "18S",     3655,  5523, "mature",
+  "ITS1",    5524,  6600, "spacer",
+  "5.8S",    6601,  6758, "mature",
+  "ITS2",    6758,  7924, "spacer",
+  "28S",     7925, 12994, "mature",
+  "3ETS",   12995, 13357, "spacer"
+) %>%
+  mutate(half = ifelse(type == "mature", 0.4, 0.15),
+         mid  = (fstart + fend) / 2)
+
+sites <- tribble(
+  ~name,      ~sstart, ~send,
+  "A'",          424,   425,
+  "A0",         1642,  1643,
+  "A1",         3654,  3655,
+  "E",          5602,  5603,
+  "A2",         6459,  6460,
+  "4a",         6915,  6965,
+  "4",          7581,  7582
+) %>%
+  mutate(x = (sstart + send) / 2) %>%
+  arrange(x) %>%
+  mutate(tier = (row_number() - 1) %% 3,          # stagger labels over 3 heights
+         yh   = 0.9 + tier * 0.55)
+
+p_anno <- ggplot() +
+  geom_rect(data = features,
+            aes(xmin = fstart - 0.5, xmax = fend + 0.5, ymin = -half, ymax = half, fill = type),
+            show.legend = FALSE) +
+  scale_fill_manual(values = c(mature = "grey20", spacer = "grey75")) +
+  geom_text(data = features, aes(x = mid, y = -0.75, label = name), size = 2.2) +
+  geom_segment(data = sites, aes(x = x, xend = x, y = 0.45, yend = yh),
+               linewidth = 0.25, colour = "grey40") +
+  geom_text(data = sites, aes(x = x, y = yh + 0.08, label = name), vjust = 0, size = 2) +
+  scale_x_continuous(breaks = seq(0, 13000, 1000)) +
+  coord_cartesian(xlim = x_range, ylim = c(-1.05, 2.3), expand = FALSE, clip = "off") +
+  labs(x = "Position on 47S (nt)", y = NULL) +
+  theme_classic(base_size = 8) +
+  theme(axis.line.y  = element_blank(),
+        axis.text.y  = element_blank(),
+        axis.ticks.y = element_blank())
+
+# ---- Combine ----
+p_main / p_anno + plot_layout(heights = c(2, 1))
+
+```
+
+## Perform a normalized analysis in the region that show sharp 3'end
+
+```{r normalized_3_end, message = FALSE, warning = FALSE, fig.width = 20, fig.height = 4, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+bw_files <- c("WT1_3_end_R2.bw", "WT2_3_end_R2.bw", "Helicase1_3_end_R2.bw", "Helicase2_3_end_R2.bw")
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region    <- GRanges(chr, IRanges(start, end))
+positions <- start:end
+
+# ---- Per-base extraction (one value per nucleotide) ----
+results <- data.frame(Position = positions)
+for (file in bw_files) {
+  vals <- import(file, which = region, as = "NumericList")[[1]]
+  vals[is.na(vals)] <- 0                       # gaps in the bigWig -> 0
+  results[[basename(file)]] <- as.numeric(vals)
+}
+
+# ---- Sum replicates ----
+pairs <- tribble(
+  ~new_name,  ~rep1,           ~rep2,
+  "wildtype_3", "WT1_3_end_R2.bw",  "WT2_3_end_R2.bw",
+  "helicase_3", "Helicase1_3_end_R2.bw",  "Helicase2_3_end_R2.bw"
+)
+
+Sum <- data.frame(Position = positions - start + 1)
+for (i in seq_len(nrow(pairs))) {
+  r1 <- pairs$rep1[i]; r2 <- pairs$rep2[i]
+  if (all(c(r1, r2) %in% names(results))) {
+    Sum[[pairs$new_name[i]]] <- results[[r1]] + results[[r2]]
+  } else {
+    warning("Skipping ", pairs$new_name[i], " (missing file column)")
+  }
+}
+
+# ---- Region definitions: site + window of 75 nt to the LEFT (site - 74 .. site) ----
+win <- 75
+
+regions <- tribble(
+  ~region,  ~site,
+  "18S",     5523,
+  "5.8",     6758,
+  "4",       7580,
+  "28S",    12994,
+  "3ETS",   13357
+) %>%
+  mutate(wstart = site - win + 1,
+         wend   = site,
+         region = factor(region, levels = region))
+
+# ---- Whole gene (all 13,352 nt), before any filtering ----
+whole_gene_rpkm <- Sum %>%
+  pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+  group_by(sample) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop")
+
+# ---- Keep only positions inside a window ----
+sum_long <- Sum %>%
+  pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+  mutate(sample = factor(sample, levels = pairs$new_name),
+         idx    = findInterval(Position, regions$wstart)) %>%
+  filter(idx > 0, Position <= regions$wend[pmax(idx, 1)]) %>%   # drop gaps between windows
+  mutate(region = regions$region[idx]) %>%
+  select(-idx)
+
+# ---- Mean signal per window ----
+region_rpkm <- sum_long %>%
+  group_by(sample, region) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop") %>%
+  pivot_wider(names_from = sample, values_from = mean_signal)
+
+# ---- Per-region y-limit: max of the whole window across samples, floor 10,000 ----
+ylims <- sum_long %>%
+  group_by(region) %>%
+  summarise(ymax = max(10000, max(signal)), .groups = "drop")
+
+###-------------
+# Plots
+###-------------
+
+x_range <- c(0.5, 13357.5)   # shared by both panels so positions line up
+
+# Scale each window by its own y-max (1 = region max; values above are clipped)
+plot_df <- sum_long %>%
+  left_join(ylims, by = "region") %>%
+  mutate(signal_scaled = pmin(signal / ymax, 1))
+
+# Window labels for the top axis
+region_labels <- regions %>%
+  left_join(ylims, by = "region") %>%
+  mutate(mid = (wstart + wend) / 2,
+         lab = paste0(region, " (", scales::comma(ymax), ")"))
+
+# ---- Coverage tracks (windows only) ----
+p_main <- ggplot(plot_df, aes(Position, signal_scaled, group = region)) +
+  geom_rect(data = regions, inherit.aes = FALSE,                 # light band marking each window
+            aes(xmin = wstart - 0.5, xmax = wend + 0.5, ymin = 0, ymax = 1),
+            fill = "grey92") +
+  geom_area(aes(fill = sample), show.legend = FALSE) +
+  scale_fill_manual(values = c(wildtype = "#2166AC", helicase = "#B2182B")) +
+  facet_wrap(~ sample, ncol = 1, strip.position = "left") +
+  scale_x_continuous(expand = c(0, 0), limits = x_range,
+                     breaks = seq(0, 13000, 1000),
+                     sec.axis = dup_axis(breaks = region_labels$mid,
+                                         labels = region_labels$lab,
+                                         name = NULL)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 8) +
+  theme(strip.background    = element_blank(),
+        strip.placement     = "outside",
+        strip.text.y.left   = element_text(angle = 0),
+        axis.text.y         = element_blank(),
+        axis.ticks.y        = element_blank(),
+        axis.text.x.bottom  = element_blank(),     # positions shown under the map instead
+        axis.ticks.x.bottom = element_blank(),
+        axis.text.x.top     = element_text(angle = 90, hjust = 0, vjust = 0.5, size = 6))
+
+# ---- 47S map ----
+features <- tribble(
+  ~name,   ~fstart, ~fend,  ~type,
+  "5ETS",       1,  3654, "spacer",
+  "18S",     3655,  5523, "mature",
+  "ITS1",    5524,  6600, "spacer",
+  "5.8S",    6601,  6758, "mature",
+  "ITS2",    6758,  7924, "spacer",
+  "28S",     7925, 12994, "mature",
+  "3ETS",   12995, 13357, "spacer"
+) %>%
+  mutate(half = ifelse(type == "mature", 0.4, 0.15),
+         mid  = (fstart + fend) / 2)
+
+sites <- tribble(
+  ~name,  ~sstart, ~send,
+  "A'",       424,   425,
+  "A0",      1642,  1643,
+  "A1",      3654,  3655,
+  "E",       5602,  5603,
+  "A2",      6459,  6460,
+  "4a",      6915,  6965,
+  "4",       7581,  7582
+) %>%
+  mutate(x = (sstart + send) / 2) %>%
+  arrange(x) %>%
+  mutate(tier = (row_number() - 1) %% 3,          # stagger labels over 3 heights
+         yh   = 0.9 + tier * 0.55)
+
+p_anno <- ggplot() +
+  geom_rect(data = features,
+            aes(xmin = fstart - 0.5, xmax = fend + 0.5, ymin = -half, ymax = half, fill = type),
+            show.legend = FALSE) +
+  scale_fill_manual(values = c(mature = "grey20", spacer = "grey75")) +
+  geom_text(data = features, aes(x = mid, y = -0.75, label = name), size = 2.2) +
+  geom_segment(data = sites, aes(x = x, xend = x, y = 0.45, yend = yh),
+               linewidth = 0.25, colour = "grey40") +
+  geom_text(data = sites, aes(x = x, y = yh + 0.08, label = name), vjust = 0, size = 2) +
+  scale_x_continuous(breaks = seq(0, 13000, 1000)) +
+  coord_cartesian(xlim = x_range, ylim = c(-1.05, 2.3), expand = FALSE, clip = "off") +
+  labs(x = "Position on 47S (nt)", y = NULL) +
+  theme_classic(base_size = 8) +
+  theme(axis.line.y  = element_blank(),
+        axis.text.y  = element_blank(),
+        axis.ticks.y = element_blank())
+
+# ---- Combine ----
+p_main / p_anno + plot_layout(heights = c(2, 1))
+
+```
+
+## per replicate 5' end in NAT10 helicase mutants.
+
+```{r normalized_per_rep, message = FALSE, warning = FALSE, fig.width = 20, fig.height = 7, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region    <- GRanges(chr, IRanges(start, end))
+positions <- start:end
+
+# ---- Sample sheet: paired replicates (5′-end libraries, R1) ----
+reps <- 1:4   # set to 1:2 until replicates 3 and 4 are available
+
+samples <- bind_rows(
+  tibble(condition = "wildtype", pair = reps, sample = paste0("WT",       reps), file = paste0("WT",       reps, "_5_end_R1.bw")),
+  tibble(condition = "helicase", pair = reps, sample = paste0("Helicase", reps), file = paste0("Helicase", reps, "_5_end_R1.bw"))
+) %>%
+  arrange(pair, desc(condition == "wildtype"))   # order: WT1, Helicase1, WT2, Helicase2, ...
+
+missing <- samples$file[!file.exists(samples$file)]
+if (length(missing) > 0) stop("Files not found: ", paste(missing, collapse = ", "))
+
+# ---- Per-base extraction, one column per replicate ----
+results <- data.frame(Position = positions)
+for (i in seq_len(nrow(samples))) {
+  v <- as.numeric(import(samples$file[i], which = region, as = "NumericList")[[1]])
+  v[is.na(v)] <- 0
+  results[[samples$sample[i]]] <- v
+}
+
+# ---- Region definitions: start positions + window length ----
+win <- 75
+
+regions <- tribble(
+  ~region,  ~rstart,
+  "5'end",       1,
+  "A'",        424,
+  "18S",      3650,
+  "5.8",      6595,
+  "28S",      7925
+) %>%
+  mutate(rend   = rstart + win - 1,
+         region = factor(region, levels = region))
+
+# ---- Long format, windows only ----
+rep_long <- results %>%
+  pivot_longer(-Position, names_to = "sample", values_to = "signal") %>%
+  left_join(select(samples, sample, condition, pair), by = "sample") %>%
+  mutate(sample = factor(sample, levels = samples$sample),
+         idx    = findInterval(Position, regions$rstart)) %>%
+  filter(idx > 0, Position <= regions$rend[pmax(idx, 1)]) %>%
+  mutate(region = regions$region[idx]) %>%
+  select(-idx)
+
+# ---- Mean signal per window, per replicate ----
+region_rpkm <- rep_long %>%
+  group_by(sample, region) %>%
+  summarise(mean_signal = mean(signal), .groups = "drop") %>%
+  pivot_wider(names_from = sample, values_from = mean_signal)
+print(region_rpkm)
+
+# ---- Per-region, PER-PAIR y-limit: max of first 100 nt within each pair, floor 10,000 ----
+ylims <- rep_long %>%
+  inner_join(regions, by = "region") %>%
+  filter(Position <= pmin(rstart + 99, rend)) %>%
+  group_by(region, pair) %>%
+  summarise(ymax = max(10000, max(signal)), .groups = "drop")
+
+print(ylims %>% pivot_wider(names_from = pair, values_from = ymax, names_prefix = "pair_"))
+
+###-------------
+# Plots
+###-------------
+
+x_range <- c(0.5, 13357.5)
+
+plot_df <- rep_long %>%
+  left_join(ylims, by = c("region", "pair")) %>%
+  mutate(signal_scaled = pmin(signal / ymax, 1))
+
+region_labels <- regions %>%
+  mutate(mid = (rstart + rend) / 2)
+
+# ---- Coverage tracks: one per replicate, pairs adjacent ----
+p_main <- ggplot(plot_df, aes(Position, signal_scaled, group = region)) +
+  geom_rect(data = regions, inherit.aes = FALSE,
+            aes(xmin = rstart - 0.5, xmax = rend + 0.5, ymin = 0, ymax = 1),
+            fill = "grey92") +
+  geom_area(aes(fill = condition), show.legend = FALSE) +
+  scale_fill_manual(values = c(wildtype = "#2166AC", helicase = "#B2182B")) +
+  facet_wrap(~ sample, ncol = 1, strip.position = "left") +
+  scale_x_continuous(expand = c(0, 0), limits = x_range,
+                     breaks = seq(0, 13000, 1000),
+                     sec.axis = dup_axis(breaks = region_labels$mid,
+                                         labels = as.character(region_labels$region),
+                                         name = NULL)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 8) +
+  theme(strip.background    = element_blank(),
+        strip.placement     = "outside",
+        strip.text.y.left   = element_text(angle = 0),
+        axis.text.y         = element_blank(),
+        axis.ticks.y        = element_blank(),
+        axis.text.x.bottom  = element_blank(),
+        axis.ticks.x.bottom = element_blank(),
+        axis.text.x.top     = element_text(angle = 90, hjust = 0, vjust = 0.5, size = 6),
+        panel.spacing.y     = unit(2, "pt"))
+
+# ---- 47S map ----
+features <- tribble(
+  ~name,   ~fstart, ~fend,  ~type,
+  "5ETS",       1,  3654, "spacer",
+  "18S",     3655,  5523, "mature",
+  "ITS1",    5524,  6600, "spacer",
+  "5.8S",    6601,  6758, "mature",
+  "ITS2",    6758,  7924, "spacer",
+  "28S",     7925, 12994, "mature",
+  "3ETS",   12995, 13357, "spacer"
+) %>%
+  mutate(half = ifelse(type == "mature", 0.4, 0.15),
+         mid  = (fstart + fend) / 2)
+
+sites <- tribble(
+  ~name,  ~sstart, ~send,
+  "A'",       424,   425,
+  "A0",      1642,  1643,
+  "A1",      3654,  3655,
+  "E",       5602,  5603,
+  "A2",      6459,  6460,
+  "4a",      6915,  6965,
+  "4",       7581,  7582
+) %>%
+  mutate(x = (sstart + send) / 2) %>%
+  arrange(x) %>%
+  mutate(tier = (row_number() - 1) %% 3,
+         yh   = 0.9 + tier * 0.55)
+
+p_anno <- ggplot() +
+  geom_rect(data = features,
+            aes(xmin = fstart - 0.5, xmax = fend + 0.5, ymin = -half, ymax = half, fill = type),
+            show.legend = FALSE) +
+  scale_fill_manual(values = c(mature = "grey20", spacer = "grey75")) +
+  geom_text(data = features, aes(x = mid, y = -0.75, label = name), size = 2.2) +
+  geom_segment(data = sites, aes(x = x, xend = x, y = 0.45, yend = yh),
+               linewidth = 0.25, colour = "grey40") +
+  geom_text(data = sites, aes(x = x, y = yh + 0.08, label = name), vjust = 0, size = 2) +
+  scale_x_continuous(breaks = seq(0, 13000, 1000)) +
+  coord_cartesian(xlim = x_range, ylim = c(-1.05, 2.3), expand = FALSE, clip = "off") +
+  labs(x = "Position on 47S (nt)", y = NULL) +
+  theme_classic(base_size = 8) +
+  theme(axis.line.y  = element_blank(),
+        axis.text.y  = element_blank(),
+        axis.ticks.y = element_blank())
+
+# ---- Combine ----
+p_main / p_anno + plot_layout(heights = c(4, 1))
+```
+
+
+## Relative A' cleavage
+
+```{r A_prime_cleavage, message = FALSE, warning = FALSE, fig.width = 2.5, fig.height = 3, fig.path = 'plots/', dev = c('png', 'pdf')}
+
+chr   <- "RNA45SN5"
+start <- 1
+end   <- 13352
+region <- GRanges(chr, IRanges(start, end))
+
+# ---- Sample sheet: paired replicates (5′-end libraries, R1) ----
+reps <- 1:4   # set to 1:2 until replicates 3 and 4 are available
+
+samples <- bind_rows(
+  tibble(condition = "wildtype", replicate = reps, file = paste0("WT",       reps, "_5_end_R1.bw")),
+  tibble(condition = "helicase", replicate = reps, file = paste0("Helicase", reps, "_5_end_R1.bw"))
+) %>%
+  mutate(condition = factor(condition, levels = c("wildtype", "helicase")))
+
+missing <- samples$file[!file.exists(samples$file)]
+if (length(missing) > 0) stop("Files not found: ", paste(missing, collapse = ", "))
+
+# ---- Windows (75 nt from each start) ----
+win     <- 75
+y_floor <- 10000   # minimum y-max per region and pair (same rule as the plots)
+
+regions <- tribble(
+  ~region,  ~rstart,
+  "5'end",       1,
+  "A'",        424,
+  "18S",      3650
+) %>%
+  mutate(rend = rstart + win - 1)
+
+target <- "A'"   # site whose relative cleavage is plotted
+
+# ---- 1. Per-base signal inside each window, per replicate ----
+per_base <- bind_rows(lapply(seq_len(nrow(samples)), function(i) {
+  v <- as.numeric(import(samples$file[i], which = region, as = "NumericList")[[1]])
+  v[is.na(v)] <- 0
+  bind_rows(lapply(seq_len(nrow(regions)), function(j) {
+    p <- regions$rstart[j]:regions$rend[j]
+    tibble(file      = samples$file[i],
+           condition = samples$condition[i],
+           replicate = samples$replicate[i],
+           region    = regions$region[j],
+           Position  = p,
+           signal    = v[p])
+  }))
+}))
+
+# ---- 2. Per-pair scaling: y-max from first 100 nt of each region, within each pair ----
+ylims <- per_base %>%
+  inner_join(regions, by = "region") %>%
+  filter(Position <= pmin(rstart + 99, rend)) %>%
+  group_by(region, replicate) %>%                       # replicate = pair
+  summarise(ymax = max(y_floor, max(signal)), .groups = "drop")
+
+scaled <- per_base %>%
+  left_join(ylims, by = c("region", "replicate")) %>%
+  mutate(signal_scaled = pmin(signal / ymax, 1))
+
+# ---- 3. Mean scaled signal per window, per replicate ----
+win_means <- scaled %>%
+  group_by(file, condition, replicate, region) %>%
+  summarise(mean_raw    = mean(signal),
+            mean_scaled = mean(signal_scaled),
+            .groups = "drop")
+
+# ---- 4. Relative cleavage from scaled values: site / (5'end + A' + 18S) ----
+cleavage <- win_means %>%
+  group_by(file, condition, replicate) %>%
+  mutate(fraction = mean_scaled / sum(mean_scaled)) %>%
+  ungroup()
+
+write.csv(cleavage, "Aprime_relative_cleavage_per_replicate.csv", row.names = FALSE)
+
+target_df <- filter(cleavage, region == target)
+
+# ---- 5. Normalize each helicase replicate to its own wildtype replicate ----
+norm_df <- target_df %>%
+  select(condition, replicate, fraction) %>%
+  group_by(replicate) %>%
+  mutate(norm = fraction / fraction[condition == "wildtype"]) %>%   # wildtype -> 1
+  ungroup()
+
+write.csv(norm_df, "Aprime_relative_cleavage_normalized.csv", row.names = FALSE)
+
+hel_norm <- norm_df %>% filter(condition == "helicase") %>% pull(norm)
+
+# ---- Summary and statistics ----
+summ <- norm_df %>%
+  group_by(condition) %>%
+  summarise(n = n(), mean = mean(norm), sd = sd(norm), .groups = "drop")
+print(summ)
+
+tt_log <- t.test(log2(hel_norm), mu = 0)   # primary: log2 ratio vs 0
+tt_lin <- t.test(hel_norm, mu = 1)         # common alternative: ratio vs 1
+print(tt_log)
+print(tt_lin)
+
+p_lab <- ifelse(tt_log$p.value < 0.001, "p < 0.001", sprintf("p = %.3g", tt_log$p.value))
+
+# ---- Bar plot: wildtype = 1, helicase mean ± SD, individual replicates ----
+set.seed(1)
+ymax_plot <- max(norm_df$norm, summ$mean + summ$sd, 1) * 1.25
+
+ggplot() +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.3, colour = "grey50") +
+  geom_col(data = summ, aes(condition, mean, fill = condition),
+           width = 0.6, alpha = 0.85, show.legend = FALSE) +
+  geom_errorbar(data = filter(summ, condition == "helicase"),
+                aes(condition, ymin = mean - sd, ymax = mean + sd),
+                width = 0.2, linewidth = 0.4) +
+  geom_jitter(data = norm_df, aes(condition, norm),
+              width = 0.08, height = 0, size = 1.8, shape = 21, fill = "white") +
+  annotate("segment", x = 1, xend = 2, y = ymax_plot * 0.9, yend = ymax_plot * 0.9,
+           linewidth = 0.3) +
+  annotate("text", x = 1.5, y = ymax_plot * 0.95, label = p_lab, size = 2.8) +
+  scale_fill_manual(values = c(wildtype = "#2166AC", helicase = "#B2182B")) +
+  scale_y_continuous(limits = c(0, ymax_plot), expand = c(0, 0)) +
+  labs(x = NULL, y = "A′ relative cleavage\n(normalized to wildtype)") +
+  theme_classic(base_size = 8)
+
+# ============================================================
+# relative cleavage WITHOUT normalization to wildtype
+# (per-pair scaling still applied; WT values are not set to 1)
+# ============================================================
+
+raw_df <- target_df %>%
+  select(condition, replicate, fraction) %>%
+  arrange(replicate)
+
+write.csv(raw_df, "Aprime_relative_cleavage_not_normalized.csv", row.names = FALSE)
+
+wt_frac  <- raw_df %>% filter(condition == "wildtype") %>% arrange(replicate) %>% pull(fraction)
+hel_frac <- raw_df %>% filter(condition == "helicase") %>% arrange(replicate) %>% pull(fraction)
+
+summ_raw <- raw_df %>%
+  group_by(condition) %>%
+  summarise(n = n(), mean = mean(fraction), sd = sd(fraction), .groups = "drop")
+print(summ_raw)
+
+tt_paired <- t.test(hel_frac, wt_frac, paired = TRUE)   # pairs matched by replicate number
+print(tt_paired)
+
+p_lab_raw <- ifelse(tt_paired$p.value < 0.001, "p < 0.001",
+                    sprintf("p = %.3g", tt_paired$p.value))
+
+ymax_raw <- max(raw_df$fraction, summ_raw$mean + summ_raw$sd) * 1.25
+
+p_raw <- ggplot() +
+  geom_col(data = summ_raw, aes(condition, mean, fill = condition),
+           width = 0.6, alpha = 0.85, show.legend = FALSE) +
+  geom_errorbar(data = summ_raw, aes(condition, ymin = mean - sd, ymax = mean + sd),
+                width = 0.2, linewidth = 0.4) +
+  geom_line(data = raw_df, aes(condition, fraction, group = replicate),
+            linewidth = 0.3, colour = "grey40") +                # connects each pair
+  geom_point(data = raw_df, aes(condition, fraction),
+             size = 1.8, shape = 21, fill = "white") +
+  annotate("segment", x = 1, xend = 2, y = ymax_raw * 0.9, yend = ymax_raw * 0.9,
+           linewidth = 0.3) +
+  annotate("text", x = 1.5, y = ymax_raw * 0.95, label = p_lab_raw, size = 2.8) +
+  scale_fill_manual(values = c(wildtype = "#2166AC", helicase = "#B2182B")) +
+  scale_y_continuous(limits = c(0, ymax_raw), expand = c(0, 0)) +
+  labs(x = NULL, y = "A′ relative cleavage\nA′ / (5′ end + A′ + 18S)") +
+  theme_classic(base_size = 8)
+
+print(p_raw)
+
+```
